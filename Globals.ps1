@@ -404,6 +404,200 @@ function Get-DCsWithMissingSubnet
 	}
 }
 
+#S-Reversible: Check for user accounts with reversible password encryption
+function Test-ReversiblePasswordEncryption
+{
+<#
+	.SYNOPSIS
+		Detects user accounts with reversible password encryption enabled.
+
+	.DESCRIPTION
+		This function identifies user accounts that have reversible password encryption enabled,
+		which represents a critical security vulnerability. When reversible encryption is enabled,
+		passwords are stored in a way that allows them to be recovered in cleartext, making
+		accounts vulnerable to DCSync attacks and password recovery.
+
+	.PARAMETER CountOnly
+		When specified, returns only the count of accounts with reversible encryption instead
+		of detailed account information.
+
+	.PARAMETER IncludeDisabled
+		When specified, includes disabled accounts in the results. By default, only enabled
+		accounts are checked.
+
+	.PARAMETER OutputFormat
+		Specifies the output format. Valid values are 'Object', 'Summary', 'Detailed'.
+		- Object: Returns PowerShell objects with account details
+		- Summary: Returns a brief summary with count and risk level
+		- Detailed: Returns comprehensive information including remediation steps
+
+	.OUTPUTS
+		PSCustomObject or Int32 (when CountOnly is specified)
+		Returns account details, count, and risk assessment information.
+
+	.EXAMPLE
+		Test-ReversiblePasswordEncryption
+		
+		Returns all enabled user accounts with reversible password encryption.
+
+	.EXAMPLE
+		Test-ReversiblePasswordEncryption -CountOnly
+		
+		Returns only the count of accounts with reversible encryption.
+
+	.EXAMPLE
+		Test-ReversiblePasswordEncryption -OutputFormat Summary
+		
+		Returns a summary with count and risk level assessment.
+
+	.EXAMPLE
+		Test-ReversiblePasswordEncryption -IncludeDisabled -OutputFormat Detailed
+		
+		Returns detailed information including disabled accounts and remediation steps.
+
+	.NOTES
+		Rule ID: S-Reversible
+		Risk Level: CRITICAL
+		
+		SECURITY CONTEXT:
+		Reversible password encryption is a critical security vulnerability that allows
+		passwords to be recovered in cleartext. This makes accounts vulnerable to:
+		- DCSync attacks
+		- Password recovery by attackers with appropriate privileges
+		- Lateral movement within the network
+		
+		REMEDIATION STEPS:
+		1. Identify all accounts with reversible encryption enabled
+		2. For each account, disable reversible encryption:
+		   - In ADUC: Uncheck "Store password using reversible encryption"
+		   - PowerShell: Set-ADUser -Identity <username> -AllowReversiblePasswordEncryption $false
+		3. Force password reset for affected accounts to ensure passwords are re-encrypted
+		4. Implement Group Policy to prevent future use of reversible encryption
+		5. Monitor for any new accounts with this setting enabled
+		
+		DETECTION METHOD:
+		Uses LDAP filter (userAccountControl:1.2.840.113556.1.4.803:=128) to identify
+		accounts with the ENCRYPTED_TEXT_PWD_ALLOWED flag (0x80/128) set.
+
+	.LINK
+		https://docs.microsoft.com/en-us/windows/security/threat-protection/security-policy-settings/store-passwords-using-reversible-encryption
+#>
+	param (
+		[Parameter(Mandatory = $false)]
+		[switch]$CountOnly,
+		[Parameter(Mandatory = $false)]
+		[switch]$IncludeDisabled,
+		[Parameter(Mandatory = $false)]
+		[ValidateSet('Object', 'Summary', 'Detailed')]
+		[string]$OutputFormat = 'Object'
+	)
+	
+	try
+	{
+		Write-Verbose "Starting S-Reversible security check for reversible password encryption"
+		
+		# Build the LDAP filter for reversible encryption
+		# UserAccountControl flag 128 (0x80) = ENCRYPTED_TEXT_PWD_ALLOWED
+		$ldapFilter = "(userAccountControl:1.2.840.113556.1.4.803:=128)"
+		
+		# Add filter to exclude disabled accounts unless specifically requested
+		if (-not $IncludeDisabled)
+		{
+			# Combine with filter to exclude disabled accounts (userAccountControl flag 2)
+			$ldapFilter = "(&(userAccountControl:1.2.840.113556.1.4.803:=128)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+		}
+		
+		Write-Verbose "Using LDAP filter: $ldapFilter"
+		
+		# Query AD for users with reversible encryption
+		$reversibleUsers = Get-ADUser -LDAPFilter $ldapFilter -Properties samAccountName, DisplayName, UserAccountControl, Enabled, whenCreated, PasswordLastSet, LastLogonDate
+		
+		$userCount = @($reversibleUsers).Count
+		Write-Verbose "Found $userCount accounts with reversible password encryption"
+		
+		# Return count only if requested
+		if ($CountOnly)
+		{
+			return $userCount
+		}
+		
+		# Determine risk level based on count
+		$riskLevel = switch ($userCount)
+		{
+			0 { "LOW" }
+			{ $_ -ge 1 -and $_ -le 5 } { "HIGH" }
+			{ $_ -ge 6 -and $_ -le 20 } { "CRITICAL" }
+			{ $_ -gt 20 } { "EXTREME" }
+			default { "UNKNOWN" }
+		}
+		
+		# Process results based on output format
+		switch ($OutputFormat)
+		{
+			'Summary' {
+				return [PSCustomObject]@{
+					RuleID = "S-Reversible"
+					Description = "User accounts with reversible password encryption"
+					AccountCount = $userCount
+					RiskLevel = $riskLevel
+					Status = if ($userCount -eq 0) { "COMPLIANT" } else { "NON-COMPLIANT" }
+					Recommendation = if ($userCount -gt 0) { "Immediately disable reversible encryption and reset passwords" } else { "No action required" }
+				}
+			}
+			'Detailed' {
+				$accountDetails = $reversibleUsers | ForEach-Object {
+					[PSCustomObject]@{
+						samAccountName = $_.samAccountName
+						DisplayName = $_.DisplayName
+						Enabled = $_.Enabled
+						whenCreated = $_.whenCreated
+						PasswordLastSet = $_.PasswordLastSet
+						LastLogonDate = $_.LastLogonDate
+						UserAccountControl = $_.UserAccountControl
+						RiskLevel = "CRITICAL"
+						RemediationCommand = "Set-ADUser -Identity '$($_.samAccountName)' -AllowReversiblePasswordEncryption `$false"
+					}
+				}
+				
+				return [PSCustomObject]@{
+					RuleID = "S-Reversible"
+					Description = "User accounts with reversible password encryption"
+					AccountCount = $userCount
+					RiskLevel = $riskLevel
+					Status = if ($userCount -eq 0) { "COMPLIANT" } else { "NON-COMPLIANT" }
+					AffectedAccounts = $accountDetails
+					RemediationSteps = @(
+						"1. Disable reversible encryption for each account",
+						"2. Force password reset for all affected accounts",
+						"3. Implement Group Policy to prevent future use",
+						"4. Monitor for new accounts with this setting"
+					)
+					SecurityImpact = "CRITICAL - Passwords can be recovered in cleartext, enabling DCSync attacks and lateral movement"
+				}
+			}
+			default { # 'Object'
+				return $reversibleUsers | Select-Object samAccountName, DisplayName, Enabled, whenCreated, PasswordLastSet, LastLogonDate, UserAccountControl
+			}
+		}
+	}
+	catch
+	{
+		Write-Error "Error during S-Reversible check: $($_.Exception.Message)"
+		if ($CountOnly)
+		{
+			return -1
+		}
+		else
+		{
+			return [PSCustomObject]@{
+				RuleID = "S-Reversible"
+				Error = $_.Exception.Message
+				Status = "ERROR"
+			}
+		}
+	}
+}
+
 #Sample variable that provides the location of the script
 [string]$ScriptDirectory = Get-ScriptDirectory
 
